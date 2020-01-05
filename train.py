@@ -28,21 +28,22 @@ def train(logger, env, maddpg: MaddpgWrapper, cfg=config):
     t = 0
     type_of_agents = maddpg.get_type_of_agents()
     num_of_agents = maddpg.get_num_of_agents()
-    writer = SummaryWriter(log_dir='./logs/' + strftime("%Y-%m-%d-%H-%M-%S", gmtime()) + '- predator-prey')
+    writer = SummaryWriter(log_dir=cfg.logs_dir + strftime("%Y-%m-%d-%H-%M-%S", gmtime()) + '- predator-prey')
     reward_mean = np.zeros(num_of_agents)
-    predator_reward_mean = []
     critic_loss_mean = []
+    collisions_mean = []
     for e in range(cfg.epochs):
         state = env.reset()
         reward_per_episode = np.zeros(num_of_agents)
-        for time_step in range(cfg.episode_length):
+        collisions_per_episode = 0
+        for time_step in range(50):
             if eval_flag or e % 500 < 2:
                 env.render('')
-                sleep(0.05)
+                sleep(0.03)
             t += 1
             actions = maddpg.step(observations=reshape_state(state))
-            next_state, rewards, dones, _ = env.step(actions)
-
+            next_state, rewards, dones, collisions = env.step(actions)
+            collisions_per_episode += np.sum(collisions['n'])
             reward_per_episode += rewards
             ER.add_memory(state=state, reward=rewards, action=actions, next_state=next_state, is_done=dones)
             state = next_state
@@ -51,36 +52,35 @@ def train(logger, env, maddpg: MaddpgWrapper, cfg=config):
                 critic_loss_mean.append(critic_loss)
             if all(dones):
                 break
+        collisions_mean.append(collisions_per_episode)
         reward_mean += reward_per_episode
         if (e + 1) % 100 == 0:
             reward_mean /= 100
             critic_loss_mean = np.mean(critic_loss_mean)
+            collisions_mean = np.mean(collisions_mean)
             for reward_per_agent, type, index in zip(reward_mean, type_of_agents, range(num_of_agents)):
                 logger.info("Episode {}/{} : average reward for {} agent {} is: \t {}"
                             .format(e, cfg.epochs, type, index, reward_per_agent))
                 print("Episode {}/{} : average reward for {} agent {} is: \t {}"
                       .format(e, cfg.epochs, type, index, reward_per_agent))
                 writer.add_scalar("{}_agent_{}/Reward Agent".format(type, index), reward_per_agent, e)
-            print("Episode {}/{} : critic loss value {}".format(e, cfg.epochs, critic_loss_mean))
-            logger.info("Episode {}/{} : \t critic loss value {}".format(e, cfg.epochs, critic_loss_mean))
-            predator_reward_mean.append(reward_mean[0])
+            print("Episode {}/{} : average collisions {} critic loss value {}".format(e, cfg.epochs, collisions_mean, critic_loss_mean))
+            logger.info("Episode {}/{} : average collisions {} critic loss value {}".format(e, cfg.epochs, collisions_mean, critic_loss_mean))
             reward_mean = np.zeros(num_of_agents)
             critic_loss_mean = []
-        if (e + 1) % 2000 == 0 and e > 10000:
-            predator_reward_mean = np.mean(predator_reward_mean)
-            if predator_reward_mean >= cfg.environment_solved_objective and not eval_flag:
+            writer.add_scalar("predators/Collisions", collisions_mean, e)
+            if collisions_mean >= cfg.environment_solved_objective and not eval_flag:
                 print("------------  Episode {}/{} : environment solved with score {} over 2000 continuous episdoes "
-                      "------------".format(e, cfg.epochs, predator_reward_mean))
+                      "------------".format(e, cfg.epochs, collisions_mean))
                 logger.info("------------  Episode {}/{} : environment solved with score {} over 2000 continuous episdoes"
-                            " ------------".format(e, cfg.epochs, predator_reward_mean))
-                maddpg.save("best")
-                exit()
-            predator_reward_mean = []
+                            " ------------".format(e, cfg.epochs, collisions_mean))
+                maddpg.save("best_{}".format(e))
+            collisions_mean = []
         if e % cfg.save_interval == 0 and not eval_flag:
             maddpg.save(epoch=e)
 
 
-def make_env(scenario_name, benchmark=False):
+def make_env(scenario_name, benchmark=True):
     from multiagent.environment import MultiAgentEnv
     import multiagent.scenarios as scenarios
 
@@ -100,7 +100,7 @@ if __name__ == '__main__':
     logger = get_logger('predator_prey_log')
     env = make_env('simple_tag')
     maddpg = MaddpgWrapper.init_from_env(env, model_dir=config.model_dir)
-    # maddpg.load(epoch="best")
+    # maddpg.load(epoch="99000")
     train(logger, env, maddpg)
     a = 5
 

@@ -2,12 +2,10 @@ from utilss.tensorflow_utils import _build_fc_layer, reshape_input_for_critic, t
 import tensorflow as tf
 import numpy as np
 from tensorflow.contrib.model_pruning.python import pruning
-from abc import abstractmethod
 import os
 from config import DensePredatorAgentConfig as cfg
-from gym.spaces import Box, Discrete
-from tensorflow.contrib.distributions.python.ops.relaxed_onehot_categorical import RelaxedOneHotCategorical, ExpRelaxedOneHotCategorical
-import random
+from gym.spaces import Box
+
 from utilss.gumbel import gumbel_softmax
 
 
@@ -105,9 +103,12 @@ class BaseNetwork:
         return var
 
 
+
+
+
 class MADDPG(BaseNetwork):
     def __init__(self, actor_input_dim, actor_output_dim, critic_state_dim, critic_action_dim,
-                 critic_other_action_dim, model_path, hidden_dim=cfg.hidden_dim, tau=cfg.tau, maddpg=True):
+                 critic_other_action_dim, model_path,  tau=cfg.tau, maddpg=True):
         super(MADDPG, self).__init__(model_path)
         self.actor_input_dim = (None, actor_input_dim)
         self.actor_output_dim = (None, actor_output_dim)
@@ -120,7 +121,6 @@ class MADDPG(BaseNetwork):
             self.critic_input_dim += critic_other_action_dim
         else:
             self.critic_other_action_dim = None
-        self.hidden_dim = hidden_dim
         self.tau = tau
         with self.graph.as_default():
                 self.critic_global_step = tf.Variable(0, trainable=False)
@@ -129,9 +129,9 @@ class MADDPG(BaseNetwork):
                 self.actor_logits = self._build_actor()
                 self.gumbel_dist = self._build_gumbel(self.actor_logits)
                 self.critic_logits = self._build_critic(self.critic_action)
-                self.actor_weight_matrices = tf.get_collection(pruning._MASKED_WEIGHT_COLLECTION)
                 self.actor_parameters = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='actor')
                 self.critic_parameters = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
+                self.actor_pruned_weight_matrices = pruning.get_masked_weights()
                 self.critic_loss = self._build_critic_loss()
                 self.critic_train_op = self._build_critic_train_op()
                 self.actor_train_op = self._build_actor_train_op()
@@ -140,6 +140,65 @@ class MADDPG(BaseNetwork):
                 self.init_variables(tf.global_variables())
                 self.actor_soft_update, self.actor_target_placeholders = self._build_soft_sync_op(self.actor_parameters)
                 self.critic_soft_update, self.critic_target_placeholders = self._build_soft_sync_op(self.critic_parameters)
+                self.sparsity = pruning.get_weight_sparsity()
+                self.hparams = pruning.get_pruning_hparams() \
+                    .parse('name={}, begin_pruning_step={}, end_pruning_step={}, target_sparsity={},'
+                           ' sparsity_function_begin_step={},sparsity_function_end_step={},'
+                           'pruning_frequency={},initial_sparsity={},'
+                           ' sparsity_function_exponent={}'.format('Actor',
+                                                                   cfg.pruning_start,
+                                                                   cfg.pruning_end,
+                                                                   cfg.target_sparsity,
+                                                                   cfg.sparsity_start,
+                                                                   cfg.sparsity_end,
+                                                                   cfg.pruning_freq,
+                                                                   cfg.initial_sparsity,
+                                                                   3))
+                # note that the global step plays an important part in the pruning mechanism,
+                # the higher the global step the closer the sparsity is to sparsity end
+                self.pruning_obj = pruning.Pruning(self.hparams, global_step=self.actor_global_step)
+                self.mask_update_op = self.pruning_obj.conditional_mask_update_op()
+                # the pruning objects defines the pruning mechanism, via the mask_update_op the model gets pruned
+                # the pruning takes place at each training epoch and it objective to achieve the sparsity end HP
+                self.init_variables(tf.global_variables())  # initialize variables in graph
+
+    def get_flat_weights(self):
+        with self.graph.as_default():
+            weights_matrices = self.sess.run(self.actor_pruned_weight_matrices)
+            flatten_matrices = []
+            for matrix in weights_matrices:
+                flatten_matrices.append(np.ndarray.flatten(matrix))
+            return flatten_matrices
+
+    def get_number_of_nnz_params(self):
+        flatten_matrices = self.get_flat_weights()
+        weights = []
+        for w in flatten_matrices:
+            weights.extend(list(w.ravel()))
+        weights_array = [w for w in weights if w != 0]
+        return len(weights_array)
+
+    def get_number_of_nnz_params_per_layer(self):
+        flatten_matrices = self.get_flat_weights()
+        nnz_at_each_layer = []
+        for matrix in flatten_matrices:
+            nnz_at_each_layer.append(len([w for w in matrix.ravel() if w != 0]))
+        return nnz_at_each_layer
+
+    def get_number_of_params(self):
+        flatten_matrices = self.get_flat_weights()
+        weights = []
+        for w in flatten_matrices:
+            weights.extend(list(w.ravel()))
+        weights_array = [w for w in weights]
+        return len(weights_array)
+
+    def prune(self):
+        self.sess.run([self.mask_update_op])
+
+    def get_model_sparsity(self):
+        sparsity = self.sess.run(self.sparsity)
+        return np.mean(sparsity)
 
     def get_weights(self):
         with self.graph.as_default():
@@ -163,7 +222,17 @@ class MADDPG(BaseNetwork):
         :param state: actor state
         :return: action in one_hot format
         """
-        actor_logits = self.sess.run(self.actor_logits, feed_dict={self.actor_state: state})
+        # actor_logits = self.sess.run(self.actor_logits, feed_dict={self.actor_state: state})
+        actor_logits = self.get_q(state)
+        return self.get_action_one_hot_from_logits(actor_logits)
+        # action = np.argmax(actor_logits, axis=-1)
+        # batch_size = np.shape(action)[0]
+        # if batch_size == 1:
+        #     return transform_one_hot(action, self.actor_output_dim[-1])
+        # else:
+        #     return transform_one_hot_batch(action, self.actor_output_dim[-1])
+
+    def get_action_one_hot_from_logits(self, actor_logits):
         action = np.argmax(actor_logits, axis=-1)
         batch_size = np.shape(action)[0]
         if batch_size == 1:
@@ -171,12 +240,13 @@ class MADDPG(BaseNetwork):
         else:
             return transform_one_hot_batch(action, self.actor_output_dim[-1])
 
+    def get_q(self, state):
+        return self.sess.run(self.actor_logits, feed_dict={self.actor_state: state})
+
     def get_gumbel(self, state):
         """
         get an action in one_hot format according to a gumbel distribution
         :param state: state
-        :param temperature: low temperature outputs a one_hot action distribution, high temperature outputs
-                            a uniform distribution (intuitively-high temperature meanse lower weights to the logits)
         :return: action distribution
         """
         gumbel_output = self.sess.run(self.gumbel_dist, feed_dict={self.actor_state: state})
@@ -243,24 +313,24 @@ class MADDPG(BaseNetwork):
             self.critic_other_action = tf.placeholder(dtype=tf.float32, shape=self.critic_other_action_dim, name='critic_other_action')
         self.critic_action = tf.placeholder(dtype=tf.float32, shape=self.critic_action_dim,
                                                   name='critic_action')
-        # self.temperature = tf.placeholder_with_default(1., shape=None, name='temperature')
 
     def _build_actor(self, scope='actor'):
         with tf.variable_scope(scope):
-            input = tf.keras.layers.BatchNormalization()(self.actor_state)
+            input = self.actor_state
+            # input = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.1)(self.actor_state)
             with tf.variable_scope("fc_1") as scope_tf:
                 fc_1 = _build_fc_layer(self=self, inputs=input, scope=scope_tf,
                                        weight_init=tf.keras.initializers.glorot_uniform(),
-                                       shape=(self.actor_input_dim[-1], self.hidden_dim), activation=tf.nn.relu)
+                                       shape=(self.actor_input_dim[-1], cfg.hidden_dim), activation=tf.nn.relu)
             with tf.variable_scope("fc_2") as scope_tf:
                 fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
                                        weight_init=tf.keras.initializers.glorot_uniform(),
-                                       shape=(self.hidden_dim, self.hidden_dim), activation=tf.nn.relu)
+                                       shape=(cfg.hidden_dim, cfg.hidden_dim), activation=tf.nn.relu)
 
             with tf.variable_scope("fc_3") as scope_tf:
                  fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
                                        weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
-                                       shape=(self.hidden_dim, self.actor_output_dim[-1]))
+                                       shape=(cfg.hidden_dim, self.actor_output_dim[-1]))
             return fc_3
 
     def _build_critic(self, critic_action, scope='critic', reuse=False):
@@ -271,21 +341,23 @@ class MADDPG(BaseNetwork):
                 critic_input = tf.concat([self.critic_state, critic_action, self.critic_other_action], axis=-1)
             else:
                 critic_input = tf.concat([self.critic_state, critic_action], axis=-1)
-            input = tf.keras.layers.BatchNormalization()(critic_input)
+            input = critic_input
+            # input = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.1)(critic_input)
             with tf.variable_scope("fc_1") as scope_tf:
                 fc_1 = _build_fc_layer(self=self, inputs=input, scope=scope_tf,
                                        weight_init=tf.keras.initializers.glorot_uniform(),
-                                       shape=(self.critic_input_dim, self.hidden_dim), activation=tf.nn.relu)
+                                       shape=(self.critic_input_dim, cfg.hidden_dim), activation=tf.nn.relu, apply_prune=False)
             with tf.variable_scope("fc_2") as scope_tf:
                 fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
                                        weight_init=tf.keras.initializers.glorot_uniform(),
-                                       shape=(self.hidden_dim, self.hidden_dim), activation=tf.nn.relu)
+                                       shape=(cfg.hidden_dim, cfg.hidden_dim), activation=tf.nn.relu, apply_prune=False)
 
             with tf.variable_scope("fc_3") as scope_tf:
                 fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
                                             weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
-                                            shape=(self.hidden_dim, 1))
+                                            shape=(cfg.hidden_dim, 1), apply_prune=False)
             return fc_3
+
 
     def _build_critic_loss(self):
         """
@@ -294,7 +366,7 @@ class MADDPG(BaseNetwork):
         """
         mse = tf.losses.mean_squared_error(labels=self.critic_target,
                                            predictions=self.critic_logits)
-        # mse = tf.reduce_mean(mse)
+        mse = tf.reduce_mean(mse)
         return mse
 
     def _build_critic_train_op(self):
@@ -325,7 +397,7 @@ class MADDPG(BaseNetwork):
         :param actor_logits: logits to build a gumbel distribution
         :return: one_hot action
         """
-        return gumbel_softmax(logits=actor_logits)
+        return gumbel_softmax(logits=actor_logits, hard=True)
 
     def _build_soft_sync_op(self, network_params):
                 params = self.sess.run(network_params)  # DNN weights
@@ -335,6 +407,103 @@ class MADDPG(BaseNetwork):
                 # new weights are weighted with tau
                 return [tf.assign(parameter, (1 - self.tau) * parameter + self.tau * weight)
                                     for parameter, weight in zip(network_params,  target_network_parameters)], target_network_parameters
+
+
+class StudentActor(BaseNetwork):
+    def __init__(self, actor_input_dim,
+                 actor_output_dim,
+                 model_path,
+                 redundancy=None,
+                 last_measure=10e4, tau=0.01):
+        super(StudentActor, self).__init__(model_path=model_path)
+        self.actor_input_dim = (None, actor_input_dim)
+        self.actor_output_dim = (None, actor_output_dim)
+        self.tau = tau
+        self.redundancy = redundancy
+        self.last_measure = last_measure
+        with self.graph.as_default():
+            self.actor_global_step = tf.Variable(0, trainable=False)
+            self._build_placeholders()
+            self.actor_logits = self._build_actor()
+            # self.gumbel_dist = self._build_gumbel(self.actor_logits)
+            self.loss = self._build_loss()
+            self.actor_parameters = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='actor')
+            self.actor_pruned_weight_matrices = pruning.get_masked_weights()
+            self.actor_train_op = self._build_actor_train_op()
+            self.actor_saver = tf.train.Saver(var_list=self.actor_parameters, max_to_keep=100)
+            self.init_variables(tf.global_variables())
+            self.sparsity = pruning.get_weight_sparsity()
+            self.hparams = pruning.get_pruning_hparams() \
+                .parse('name={}, begin_pruning_step={}, end_pruning_step={}, target_sparsity={},'
+                       ' sparsity_function_begin_step={},sparsity_function_end_step={},'
+                       'pruning_frequency={},initial_sparsity={},'
+                       ' sparsity_function_exponent={}'.format('Actor',
+                                                               cfg.pruning_start,
+                                                               cfg.pruning_end,
+                                                               cfg.target_sparsity,
+                                                               cfg.sparsity_start,
+                                                               cfg.sparsity_end,
+                                                               cfg.pruning_freq,
+                                                               cfg.initial_sparsity,
+                                                               3))
+            # note that the global step plays an important part in the pruning mechanism,
+            # the higher the global step the closer the sparsity is to sparsity end
+            self.pruning_obj = pruning.Pruning(self.hparams, global_step=self.actor_global_step)
+            self.mask_update_op = self.pruning_obj.conditional_mask_update_op()
+            # the pruning objects defines the pruning mechanism, via the mask_update_op the model gets pruned
+            # the pruning takes place at each training epoch and it objective to achieve the sparsity end HP
+            self.init_variables(tf.global_variables())  # initialize variables in graph
+
+    def save(self, path=None):
+        save_dir = path or self.model_path
+        self.save_model(saver=self.actor_saver, path=save_dir)
+
+    def load(self, path=None):
+        save_dir = path or self.model_path
+        self.load_model(saver=self.actor_saver, path=save_dir)
+
+    def act(self, state):
+        """
+        deciding an action via the logits, no exploration(?)
+        :param state: actor state
+        :return: action in one_hot format
+        """
+        # actor_logits = self.sess.run(self.actor_logits, feed_dict={self.actor_state: state})
+        actor_logits = self.get_q(state)
+        action = np.argmax(actor_logits, axis=-1)
+        batch_size = np.shape(action)[0]
+        if batch_size == 1:
+            return transform_one_hot(action, self.actor_output_dim[-1])
+        else:
+            return transform_one_hot_batch(action, self.actor_output_dim[-1])
+
+    def get_q(self, state):
+        return self.sess.run(self.actor_logits, feed_dict={self.actor_state: state})
+
+    def _build_actor(self):
+
+        raise NotImplementedError
+
+    def _build_placeholders(self):
+        self.actor_state = tf.placeholder(dtype=tf.float32, shape=self.actor_input_dim, name='actor_state')
+        self.actor_learning_rate = tf.placeholder(dtype=tf.float32, shape=None, name='actor_learning_rate')
+        self.target_logits = tf.placeholder(dtype=tf.float32, shape=self.actor_output_dim, name='target_dist')
+
+    def _build_actor_train_op(self):
+        """
+              the suggested optimizer according to Policy distillation
+        """
+        return tf.train.RMSPropOptimizer(learning_rate=self.actor_learning_rate, name='optimizer').minimize(self.loss)
+
+    def _build_loss(self):
+        """
+        KLL  policy distillation loss function we want to minimize, according to Policy distillation
+        """
+        eps = 0.00001
+        teacher_sharpend_dist = tf.nn.softmax(self.target_logits / self.tau, dim=1) + eps
+        teacher_sharpend_dist = tf.squeeze(teacher_sharpend_dist)
+        student_dist = tf.nn.softmax(self.actor_logits, dim=1) + eps
+        return tf.reduce_sum(teacher_sharpend_dist * tf.log(teacher_sharpend_dist / student_dist))
 
 
 class MaddpgWrapper:
@@ -361,11 +530,11 @@ class MaddpgWrapper:
                 self.agents.append(MADDPG(actor_input_dim=actor_input_dim[i], actor_output_dim=actor_output_dim[i],
                                           critic_state_dim=critic_state_dim, critic_action_dim=actor_output_dim[i],
                                           critic_other_action_dim=critic_other_action_dim, maddpg=True,
-                                          model_path=model_dir + "adv_{}".format(i)))
+                                          model_path=model_dir + "_adv_{}".format(i)))
                 self.target_agents.append(MADDPG(actor_input_dim=actor_input_dim[i], actor_output_dim=actor_output_dim[i],
                                           critic_state_dim=critic_state_dim, critic_action_dim=actor_output_dim[i],
                                           critic_other_action_dim=critic_other_action_dim, maddpg=True,
-                                          model_path=model_dir + "target_adv_{}".format(i)))
+                                          model_path=model_dir + "_target_adv_{}".format(i)))
             else:  # DDPG
                 self.agents.append(MADDPG(actor_input_dim=actor_input_dim[i], actor_output_dim=actor_output_dim[i],
                                           critic_state_dim=actor_input_dim[i], critic_action_dim=actor_output_dim[i],
@@ -383,17 +552,13 @@ class MaddpgWrapper:
              Instantiate instance of this class from multi-agent environment
         """
         critic_state_dim, critic_action_dim = 0, 0
-        discrete_action = True
         output_dim = []
         get_shape = lambda x: x.shape[0]
         input_dim = []
         type_of_agents = ['adversary' if a.adversary else 'normal' for a in env.agents]
         for action_space, obs_space in zip(env.action_space, env.observation_space):
             input_dim.append(obs_space.shape[0])
-            if isinstance(action_space, Box):
-                discrete_action = False
-            else:  # Discrete
-                get_shape = lambda x: x.n
+            get_shape = lambda x: x.n
             output_dim.append(get_shape(action_space))
             critic_state_dim += input_dim[-1]
             # --------- MADDPG for critic ---------
@@ -403,8 +568,6 @@ class MaddpgWrapper:
                        critic_state_dim=critic_state_dim, critic_action_dim=critic_action_dim,
                        model_dir=model_dir)
         return instance
-
-
 
     def get_agents(self):
         return self.agents
@@ -449,8 +612,18 @@ class MaddpgWrapper:
         :return mean of the actor/critic loss
         """
         critic_loss_value_mean = 0
+
+        # this is not according to the paper but it forces the predators to learn a strategy together and not let the
+        # smartest predator do all the work
+        # (on several occasions just one predator ran after the prey which doesn't work
+        # once the prey learns he can just speed up and avoid the predator)
         for i in range(self.num_of_agents):
             batch_of_samples = ER.getMiniBatch(batch_size=config.batch_size)
+            # if self.type_of_agents[i] != "adversary":
+                # adversary's are the predators, the prey should not learn with the predators,
+                # more similar to paper this way
+                # batch_of_samples = ER.getMiniBatch(batch_size=config.batch_size)
+                # continue
             critic_loss_value = self.update_agent(batch_of_samples=batch_of_samples, agent_index=i,
                                                                   epoch=epoch, config=config)
             critic_loss_value_mean += critic_loss_value
@@ -503,20 +676,45 @@ class MaddpgWrapper:
         if is_maddpg:
             other_agents_actions = self.get_other_agents_actions(states=states, curr_agent_index=agent_index)
             other_agents_actions = reshape_input_for_critic(other_agents_actions)
-            # TODO maybe try using the given actions... currently following pytorch implementation
+        # TODO maybe try using the given actions... currently following pytorch implementation,
+        #  if this is commented out this means we tried, its also according to the paper
         else:
             other_agents_actions = None
         curr_agent.train_actor(actor_state=states[agent_index], critic_state=critic_state_in,
                                other_action=other_agents_actions, learning_rate=cfg.learning_rate_schedule(epoch))
         return critic_loss
 
-    def save(self, epoch):
-        for agent in self.agents:
-            agent.save(epoch=epoch)
+    def save(self, epoch, path=None):
+        i = 0
+        for agent, type in zip(self.agents, self.type_of_agents):
+            if path:
+                path_i = path + "/predator_{}_{}".format(type, i)
+                agent.save(epoch=epoch, path=path_i)
+            else:
+                agent.save(epoch=epoch)
+            i += 1
 
-    def load(self, epoch):
-        for agent in self.agents:
-            agent.load(epoch=epoch)
+    def load(self, epoch, path=None):
+        i = 0
+        for agent, type in zip(self.agents, self.type_of_agents):
+            if path:
+                path_i = path + "/predator_{}_{}".format(type, i)
+                agent.load(epoch=epoch, path=path_i)
+
+            else:
+                agent.load(epoch=epoch, path=path)
+            i += 1
+
+
+    def load_normal(self, epoch):
+        for i, type in enumerate(self.type_of_agents):
+            if type != 'adversary':
+                  self.agents[i].load(epoch=epoch)
+
+    def load_adv(self, epoch):
+        for i, type in enumerate(self.type_of_agents):
+            if type == 'adversary':
+                  self.agents[i].load(epoch=epoch)
 
     def update_targets(self):
         for curr_agent, target_curr_agent in zip(self.agents, self.target_agents):
@@ -525,358 +723,129 @@ class MaddpgWrapper:
             target_curr_agent.soft_update(params=critic_params, actor_flag=False)
 
 
+class PredatorStudent(StudentActor):
 
-# class Network(BaseNetwork):
-#     def __init__(self, input_dim, out_dim, discrete_action, model_path, scope):
-#         super(Network, self).__init__(model_path)
-#         self.input_dim = (None, input_dim)
-#         self.out_dim = (None, out_dim)
-#         self.discrete_action = discrete_action
-#         with self.graph.as_default():
-#             self.global_step = tf.Variable(0, trainable=False)
-#             self._build_placeholders()
-#             self.logits = self._build_logits(scope)
-#             self.weights_matrices = pruning.get_masked_weights()
-#             self.loss = self._build_loss()
-#             self.train_op = self._build_train_op()
-#             self.saver = tf.train.Saver(var_list=tf.global_variables(), max_to_keep=100)
-#             self.init_variables(tf.global_variables())
-#
-#     def _build_placeholders(self):
-#         self.input = tf.placeholder(dtype=tf.float32, shape=self.input_dim, name='input')
-#         self.target = tf.placeholder(dtype=tf.float32, shape=self.out_dim, name='target')
-#         self.learning_rate = tf.placeholder(dtype=tf.float32, shape=None, name='learning_rate')
-#         self.error_weights = tf.placeholder(dtype=tf.float32, shape=None, name='td_errors_weight')
-#
-#     def get_q(self, state):
-#         """
-#         feed the state through the network
-#         :param state: input to DNN
-#         :return: output vector with out_dim elements
-#         """
-#         return self.sess.run(self.logits, feed_dict={self.input: state})
-#
-#     def soft_update(self, params):
-#         with self.graph.as_default():
-#             params_dict = {}
-#             for place_holder, param in zip(self.target_network_parameters, params):
-#                 params_dict[place_holder] = param
-#             self.sess.run(self.soft_sync, feed_dict=params_dict)
-#
-#     def get_weights(self):
-#         with self.graph.as_default():
-#             return self.sess.run(self.network_parameters)
-#
-#     def get_params(self):
-#         with self.graph.as_default():
-#             return self.sess.run(self.network_parameters)
-#
-#     @abstractmethod
-#     def _build_logits(self, scope):
-#         pass
-#
-#     @abstractmethod
-#     def _build_loss(self):
-#         self.td_errors = None
-#         pass
-#
-#     @abstractmethod
-#     def _build_train_op(self):
-#         pass
-#
-#
-# class ActorMLPNetwork(Network):
-#     """
-#     MLP network (can be used as value or policy)
-#     """
-#     def __init__(self, input_dim, out_dim, model_path, scope, discrete_action=True, tau=0.01, hidden_dim=64):
-#
-#         self.hidden_dim = hidden_dim
-#         self.tau = tau
-#         super(ActorMLPNetwork, self).__init__(input_dim, out_dim, discrete_action, model_path, scope=scope)
-#         with self.graph.as_default():
-#             self.network_parameters = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-#             params = self.sess.run(self.network_parameters)
-#             self.target_network_parameters = [tf.placeholder(dtype=tf.float32, shape=np.shape(network_parameter))
-#                                               for network_parameter in params]
-#             self.soft_sync = [tf.assign(parameter, (1 - tau) * parameter + tau * weight)  # self is target
-#                                 for parameter, weight in zip(self.network_parameters,  self.target_network_parameters)]
-#
-#     def _build_placeholders(self):
-#         super(ActorMLPNetwork, self)._build_placeholders()
-#         # self.gumbel = tf.placeholder(tf.bool, shape=[])
-#         self.temperature = tf.placeholder_with_default(input=1.0, shape=[])
-#         self.action_gradient_from_critic = tf.placeholder(dtype=tf.float32, shape=self.out_dim,
-#                                                           name='grad_from_critic')
-#         self.batch_size = tf.placeholder(dtype=tf.float32, shape=None, name='batch_size')
-#
-#     # def soft_update(self, params):
-#     #     with self.graph.as_default():
-#     #         params_dict = {}
-#     #         for place_holder, param in zip(self.target_network_parameters, params):
-#     #             params_dict[place_holder] = param
-#     #         self.sess.run(self.soft_sync, feed_dict=params_dict)
-#     #
-#     # def get_params(self):
-#     #     with self.graph.as_default():
-#     #         return self.sess.run(self.network_parameters)
-#     #
-#     # def get_weights(self):
-#     #     with self.graph.as_default():
-#     #         return self.sess.run(self.network_parameters)
-#
-#     def get_q(self, state, temperature=1.0):
-#         """
-#         feed the state through the network
-#         :param state: input to DNN
-#         :param temperature: temperature to gumbel distribution
-#         :return: output vector with out_dim elements
-#         """
-#         return self.sess.run(self.logits, feed_dict={self.input: state, self.temperature: temperature})
-#
-#     def act(self, state):
-#         """
-#         feed the state through the network
-#         :param state: input to DNN
-#         :param temperature: temperature to gumbel distribution
-#         :return: output vector with out_dim elements
-#         """
-#         logits = self.sess.run(self.fc_3, feed_dict={self.input: state})
-#         action = np.argmax(logits, axis=-1)
-#         action = transform_one_hot_batch(batch_index=action, size=self.out_dim[-1])
-#         return np.squeeze(action)
-#
-#     def _build_logits(self, scope):
-#         with tf.variable_scope(scope):
-#             input = tf.keras.layers.BatchNormalization()(self.input)
-#             with tf.variable_scope("fc_1") as scope_tf:
-#                 fc_1 = _build_fc_layer(self=self, inputs=input, scope=scope_tf,
-#                                        weight_init=tf.keras.initializers.glorot_uniform(),
-#                                        shape=(self.input_dim[-1], self.hidden_dim), activation=tf.nn.relu)
-#             with tf.variable_scope("fc_2") as scope_tf:
-#                 fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
-#                                        weight_init=tf.keras.initializers.glorot_uniform(),
-#                                        shape=(self.hidden_dim, self.hidden_dim), activation=tf.nn.relu)
-#
-#             with tf.variable_scope("fc_3") as scope_tf:
-#                  self.fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
-#                                        weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
-#                                        shape=(self.hidden_dim, self.out_dim[-1]))
-#             output = RelaxedOneHotCategorical(temperature=self.temperature, logits=self.fc_3).sample()
-#             return output
-#
-#     def _build_train_op(self):
-#         """
-#          build Optimizer in graph
-#         :return: an optimizer
-#         """
-#         network_params = tf.trainable_variables()
-#         # batch_size = tf.dtypes.cast(tf.shape(self.input)[0], tf.float32)
-#         self.gradients = tf.gradients(ys=self.logits, xs=network_params,
-#                                  grad_ys=-self.action_gradient_from_critic / self.batch_size)
-#         gradients = self.gradients
-#         # we are doing gradient ascent like the DDPG gradient purposed by David Silver
-#         # the gradient of the actor parameters w.r.t the state and the action chosen, is the critic gradient w.r.t
-#         # to the action chosen multiplied with the gradient of the action chosen w.r.t to the actors parameters
-#         # derivative of ys w.r.t to xs is the gradient of the action w.r.t to the a_params multiplied by grad_ys, which
-#         # is the gradient from the critic of the state and the action w.r.t to the critic params
-#         # capped_gvs = []
-#         # for grad in gradients:  # clip gradients
-#         #     capped_gvs.append(tf.clip_by_value(grad, 0.5))
-#         return tf.train.AdamOptimizer(self.learning_rate). \
-#             apply_gradients(zip(gradients, network_params), global_step=self.global_step)
-#
-#     def train_actor(self, actor_state_in, q_gradient_input, learning_rate):
-#         batch_size = np.shape(actor_state_in)[0]
-#         _, gradients = self.sess.run([self.train_op, self.gradients],
-#                       feed_dict={self.input: actor_state_in,
-#                                  self.action_gradient_from_critic: q_gradient_input,
-#                                  self.learning_rate: learning_rate,
-#                                  self.temperature: 1.0,
-#                                  self.batch_size: batch_size})
-#
-#     # def _build_logits_critic(self, scope):
-#     #     with tf.variable_scope(scope):
-#     #         with tf.variable_scope("fc_1") as scope_tf:
-#     #             fc_1 = _build_fc_layer(self=self, inputs=self.input, scope=scope_tf,
-#     #                                    weight_init=tf.keras.initializers.glorot_uniform(),
-#     #                                    shape=(self.input_dim[-1], self.hidden_dim), activation=tf.nn.relu)
-#     #         with tf.variable_scope("fc_2") as scope_tf:
-#     #             fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
-#     #                                    weight_init=tf.keras.initializers.glorot_uniform(),
-#     #                                    shape=(self.hidden_dim, self.hidden_dim), activation=tf.nn.relu)
-#     #
-#     #         with tf.variable_scope("fc_3") as scope_tf:
-#     #              self.fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
-#     #                                    weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
-#     #                                    shape=(self.hidden_dim, self.out_dim[-1]))
-#     #         return self.fc_3
-#
-#
-#
-# class CriticMLPNetwork(Network):
-#     """
-#     MLP network (can be used as value or policy)
-#     """
-#
-#     def __init__(self, state_in_dim, action_in_dim, out_dim, model_path, scope, discrete_action=True, tau=0.01, hidden_dim=64):
-#
-#         self.hidden_dim = hidden_dim
-#         self.tau = tau
-#         self.action_in_dim = action_in_dim
-#         self.state_dim = state_in_dim
-#         super(CriticMLPNetwork, self).__init__(state_in_dim + action_in_dim, out_dim, discrete_action, model_path, scope=scope)
-#         with self.graph.as_default():
-#             self.network_parameters = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-#             params = self.sess.run(self.network_parameters)
-#             self.target_network_parameters = [tf.placeholder(dtype=tf.float32, shape=np.shape(network_parameter))
-#                                               for network_parameter in params]
-#             self.soft_sync = [tf.assign(parameter, (1 - tau) * parameter + tau * weight)  # self is target
-#                               for parameter, weight in zip(self.network_parameters, self.target_network_parameters)]
-#             self.actor_gradients = tf.gradients(ys=self.logits, xs=self.action_in)
-#
-#     def compute_gradients(self, state, action):
-#         return self.sess.run([self.actor_gradients, self.logits], feed_dict={self.state_in: state,
-#                                                                              self.action_in: action})
-#
-#     def _build_placeholders(self):
-#         super(CriticMLPNetwork, self)._build_placeholders()
-#         # self.gumbel = tf.placeholder(tf.bool, shape=[])
-#         self.action_in = tf.placeholder(dtype=tf.float32, shape=(None, self.action_in_dim), name='input_action')
-#         self.state_in = tf.placeholder(dtype=tf.float32, shape=(None, self.state_dim), name='input_state')
-#         self.input = tf.concat(axis=1, values=[self.state_in, self.action_in])
-#
-#     def get_q(self, state):
-#         """
-#         feed the state through the network
-#         :param state: input to DNN
-#         :return: output vector with out_dim elements
-#         """
-#         return self.sess.run(self.logits, feed_dict={self.input: state})
-#
-#     def _build_logits(self, scope):
-#         with tf.variable_scope(scope):
-#             input = tf.keras.layers.BatchNormalization()(self.input)
-#             with tf.variable_scope("fc_1") as scope_tf:
-#                 fc_1 = _build_fc_layer(self=self, inputs=input, scope=scope_tf,
-#                                        weight_init=tf.keras.initializers.glorot_uniform(),
-#                                        shape=(self.input_dim[-1], self.hidden_dim), activation=tf.nn.relu)
-#             with tf.variable_scope("fc_2") as scope_tf:
-#                 fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
-#                                        weight_init=tf.keras.initializers.glorot_uniform(),
-#                                        shape=(self.hidden_dim, self.hidden_dim), activation=tf.nn.relu)
-#
-#             with tf.variable_scope("fc_3") as scope_tf:
-#                 self.fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
-#                                             weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
-#                                             shape=(self.hidden_dim, self.out_dim[-1]))
-#             return self.fc_3
-#
-#     def _build_train_op(self):
-#         """
-#          build Optimizer in graph
-#         :return: an optimizer
-#         """
-#         # return tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(self.loss,
-#         #                                                                          global_step=self.global_step)
-#         optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-#         gradients = optimizer.compute_gradients(loss=self.loss, var_list=tf.trainable_variables())
-#         # capped_gvs = [(tf.clip_by_norm(grad, 0.5), var) for grad, var in gradients]
-#         return optimizer.apply_gradients(gradients)
-#
-#     def _build_loss(self):
-#         """
-#         build loss function = MSE(target, logits)
-#         :return: a loss fn
-#         """
-#         mse = tf.losses.mean_squared_error(labels=self.target,
-#                                            predictions=self.logits)  # if not per then this error weights are 1
-#         mse = tf.reduce_mean(mse)
-#         return mse
-#
-#     def learn(self, target_batch, learning_rate, input):
-#         """
-#         one batch learning function via gradient decent method
-#         :param target_batch: target batch, essential for loss function calculation
-#         :param learning_rate: learning rate for determining the step size in the iterative gradient decent method
-#         :param input: input to DNN
-#         :param weights: weights for elements in batch ( used to weight the loss function according to the elements)
-#                         needed only when using Prioritized experience replay
-#         :return: mean loss value and the td error for each element in the batch w.r.t to according element in Model(input)
-#         """
-#         _, loss = self.sess.run([self.train_op, self.loss],
-#                                            feed_dict={self.input: input,
-#                                                       self.target: target_batch,
-#                                                       self.learning_rate: learning_rate})
-#         return loss
+    def _get_initial_size(self):
+        return [self.actor_input_dim[-1] * cfg.hidden_dim, cfg.hidden_dim ** 2,
+                cfg.hidden_dim * self.actor_output_dim[-1]]
+
+    def _calculate_sizes_according_to_redundancy(self):
+        assert self.redundancy is not None
+        initial_sizes = self._get_initial_size()
+        total_number_of_parameters_for_next_iteration = []
+        for i, initial_num_of_params_at_layer in enumerate(initial_sizes):
+            total_number_of_parameters_for_next_iteration.append(
+                int(initial_num_of_params_at_layer * (1 - self.redundancy[i])))  # 1 - whats not important = important
+        current_size = total_number_of_parameters_for_next_iteration[0] * self.actor_input_dim[-1] + \
+                       total_number_of_parameters_for_next_iteration[1] * total_number_of_parameters_for_next_iteration[0] + \
+                       self.actor_output_dim[-1] * total_number_of_parameters_for_next_iteration[1]
+        # to ensure that the size is monotonically decreasing
+        while current_size > self.last_measure:
+            i = np.argmax(total_number_of_parameters_for_next_iteration)
+            total_number_of_parameters_for_next_iteration[i] -= 1
+            current_size = total_number_of_parameters_for_next_iteration[0] * self.actor_input_dim[-1] + \
+                           total_number_of_parameters_for_next_iteration[1] * total_number_of_parameters_for_next_iteration[0] + \
+                           self.actor_output_dim[-1] * total_number_of_parameters_for_next_iteration[1]
+
+        # to ensure no zero parameters
+        i = np.argmin(total_number_of_parameters_for_next_iteration)
+        while total_number_of_parameters_for_next_iteration[i] < 1:
+            total_number_of_parameters_for_next_iteration[i] = 4
+            total_number_of_parameters_for_next_iteration[0] = (total_number_of_parameters_for_next_iteration[0] +
+                                          total_number_of_parameters_for_next_iteration[1]) / (
+                                                 self.actor_input_dim[-1] + total_number_of_parameters_for_next_iteration[1])
+            i = np.argmin(total_number_of_parameters_for_next_iteration)
+
+        for i, size in enumerate(total_number_of_parameters_for_next_iteration):
+            total_number_of_parameters_for_next_iteration[i] = int(size)
+
+        return total_number_of_parameters_for_next_iteration
+
+    def _build_actor(self):
+        if self.redundancy is None:
+            fc_1_dim = cfg.hidden_dim
+            fc_2_dim = cfg.hidden_dim
+        else:
+            new_size_parameters = self._calculate_sizes_according_to_redundancy()
+            fc_1_dim = new_size_parameters[0]
+            fc_2_dim = new_size_parameters[1]
+        with tf.variable_scope('actor'):
+            input = tf.keras.layers.BatchNormalization()(self.actor_state)
+            with tf.variable_scope("fc_1") as scope_tf:
+                fc_1 = _build_fc_layer(self=self, inputs=input, scope=scope_tf,
+                                       weight_init=tf.keras.initializers.glorot_uniform(),
+                                       shape=(self.actor_input_dim[-1], fc_1_dim), activation=tf.nn.relu)
+            with tf.variable_scope("fc_2") as scope_tf:
+                fc_2 = _build_fc_layer(self=self, inputs=fc_1, scope=scope_tf,
+                                       weight_init=tf.keras.initializers.glorot_uniform(),
+                                       shape=(fc_1_dim, fc_2_dim), activation=tf.nn.relu)
+
+            with tf.variable_scope("fc_3") as scope_tf:
+                fc_3 = _build_fc_layer(self=self, inputs=fc_2, scope=scope_tf,
+                                       weight_init=tf.keras.initializers.RandomUniform(minval=-3e-3, maxval=3e-3),
+                                       shape=(fc_2_dim, self.actor_output_dim[-1]))
+            return fc_3
 
 
-# class DDPGAgent:
-#
-#     def __init__(self, input_dim, output_dim, critic_state_dim, critic_action_dim,
-#                  model_dir,
-#                  index,
-#                  type,
-#                  hidden_dim=64,
-#                  discrete_action=False,
-#                  explore_eps=1.0):
-#         with tf.variable_scope('Actor_{}'.format(index)):
-#             self.policy = ActorMLPNetwork(input_dim=input_dim, out_dim=output_dim, discrete_action=discrete_action,
-#                                           model_path=model_dir + "/actor", hidden_dim=hidden_dim, scope='eval')
-#             self.critic = CriticMLPNetwork(state_in_dim=critic_state_dim, action_in_dim=critic_action_dim, out_dim=1,
-#                                            discrete_action=True, model_path=model_dir + "/critic",
-#                                            hidden_dim=hidden_dim, scope='eval')
-#         with tf.variable_scope('Critic_{}'.format(index)):
-#             self.target_policy = ActorMLPNetwork(input_dim=input_dim, out_dim=output_dim, discrete_action=discrete_action,
-#                                                  model_path=model_dir + "/actor", hidden_dim=hidden_dim, scope='target')
-#             self.target_critic = CriticMLPNetwork(state_in_dim=critic_state_dim, action_in_dim=critic_action_dim,  out_dim=1,
-#                                                   discrete_action=True, model_path=model_dir + "/critic",
-#                                                   hidden_dim=hidden_dim, scope='target')
-#         self.discrete_action = discrete_action
-#         self.output_dim = output_dim
-#         self.input_dim = input_dim
-#         self.index = index
-#         self.type = type
-#         self.explore_eps = explore_eps
-#
-#     def step(self, state, temp):
-#         """
-#         Take a step forward in environment for a minibatch of states
-#         :param state: Observations for this agent
-#         :param explore: Whether or not to add exploration noise
-#         :return: Actions for this agent
-#         """
-#         action_dist = self.policy.get_q(state=state, temperature=temp)
-#         action = np.random.choice(np.arange(self.output_dim), p=action_dist.ravel())
-#         action = transform_one_hot(index=action, size=self.output_dim)
-#         return np.squeeze(action)
-#
-#     def degrade_explore(self):
-#         self.explore_eps = max(0.0001, self.explore_eps * 0.9995)
-#         return self.explore_eps
-#     # def target_step(self, state, critic_state):
-#     #     q_values = self.target_policy.get_q(state=state)
-#     #     critic_feedback = self.target_critic.get_q(state=critic_state)
-#     #     return q_values, critic_feedback
-#
-#     def save_model(self, epoch):
-#         self.policy.save_model(epoch)
-#         self.critic.save_model(epoch)
-#
-#     def load_model(self, epoch, model_dir):
-#             self.policy.load_model(path=model_dir + "/actor", epoch=epoch)
-#             self.critic.load_model(path=model_dir + "/critic", epoch=epoch)
-#
-#     def soft_update(self):
-#         critic_params = self.critic.get_params()
-#         self.target_critic.soft_update(params=critic_params)
-#         actor_params = self.policy.get_params()
-#         self.target_policy.soft_update(params=actor_params)
-#
-#
+class StudentMaddpgWrapper(MaddpgWrapper):
+    def __init__(self, actor_input_dim,
+                 type_of_agents,
+                 actor_output_dim,
+                 critic_state_dim,
+                 critic_action_dim,
+                 student_index,
+                 model_dir,
+                 student_redundancy=None,
+                 last_measure=1e5):
+        """
+        Initialize an instance of the MADDPG model with one soon-to-be-pruned student
+        :param actor_input_dim:
+        :param actor_output_dim:
+        :param critic_state_dim:
+        :param critic_action_dim:
+         :param student_index: student agent index
+        :param model_dir:
+        """
+        self.student_index = student_index
+        self.num_of_agents = len(type_of_agents)
+        self.agents = []
+        self.type_of_agents = type_of_agents
+        for i, type in enumerate(type_of_agents):
+            if i == student_index:
+                self.agents.append(PredatorStudent(actor_input_dim,
+                 actor_output_dim, model_dir + "/pruned_student/", redundancy=student_redundancy, last_measure=last_measure))
+
+            if type == "adversary":  # MADDPG
+                critic_other_action_dim = critic_action_dim - actor_output_dim[i]
+                self.agents.append(MADDPG(actor_input_dim=actor_input_dim[i], actor_output_dim=actor_output_dim[i],
+                                          critic_state_dim=critic_state_dim, critic_action_dim=actor_output_dim[i],
+                                          critic_other_action_dim=critic_other_action_dim, maddpg=True,
+                                          model_path=model_dir + "_adv_{}".format(i)))
+            else:  # DDPG
+                self.agents.append(MADDPG(actor_input_dim=actor_input_dim[i], actor_output_dim=actor_output_dim[i],
+                                          critic_state_dim=actor_input_dim[i], critic_action_dim=actor_output_dim[i],
+                                          critic_other_action_dim=None, maddpg=False,
+                                          model_path=model_dir + "_{}".format(i)))
+        self.model_dir = model_dir
 
 
 
+    def step(self, observations):
+        """
+           Take a step forward in environment with all agents
+           Inputs:
+               observations: List of observations for each agent
+               explore (boolean): Whether or not to add exploration noise
+           Outputs:
+               actions: List of actions for each agent
+               teacher_Q_value:  student_index_Q_value
+           """
+        action = []
+        for agent, obs, i in zip(self.agents, observations, range(len(self.agents))):
+                if i == self.student_index:
+                    teacher_Q_value = agent.get_q(obs)
+
+        return [a.act(obs) for a, obs in zip(self.agents, observations)]
 
 
 
